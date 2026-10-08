@@ -1,0 +1,169 @@
+# Defense evasion: logging and security tooling tampering.
+
+id: cloudtrail-logging-disabled
+title: CloudTrail logging stopped or trail deleted
+type: match
+severity: critical
+description: >
+  StopLogging, DeleteTrail, or CloudTrail Lake event data store deletion /
+  ingestion stop. Failed attempts are reported too - an AccessDenied here is
+  still a strong signal of an intruder testing their reach.
+attack: [T1562.008]
+falsepositives:
+  - Planned trail migrations (should be rare and change-managed).
+match:
+  eventSource: cloudtrail.amazonaws.com
+  eventName: [StopLogging, DeleteTrail, DeleteEventDataStore, StopEventDataStoreIngestion]
+tests:
+  positive:
+    - {eventSource: cloudtrail.amazonaws.com, eventName: StopLogging, requestParameters: {name: org-trail}}
+    - {eventSource: cloudtrail.amazonaws.com, eventName: DeleteTrail, errorCode: AccessDenied, requestParameters: {name: org-trail}}
+  negative:
+    - {eventSource: cloudtrail.amazonaws.com, eventName: StartLogging, requestParameters: {name: org-trail}}
+    - {eventSource: cloudtrail.amazonaws.com, eventName: DescribeTrails}
+---
+id: cloudtrail-config-weakened
+title: CloudTrail configuration weakened
+type: match
+severity: high
+description: >
+  A trail was modified to stop covering all regions or global services, or
+  its event selectors were changed to drop management events or write events.
+attack: [T1562.008]
+falsepositives:
+  - Cost-driven selector changes that were reviewed and approved.
+match:
+  eventSource: cloudtrail.amazonaws.com
+  errorCode: {exists: false}
+  any:
+    - eventName: UpdateTrail
+      any:
+        - requestParameters.isMultiRegionTrail: false
+        - requestParameters.includeGlobalServiceEvents: false
+        - requestParameters.s3BucketName: {exists: true}
+    - eventName: PutEventSelectors
+      any:
+        - requestParameters.eventSelectors.includeManagementEvents: false
+        - requestParameters.eventSelectors.readWriteType: ReadOnly
+        - all:
+            - requestParameters.advancedEventSelectors: {exists: true}
+            - not:
+                requestParameters.advancedEventSelectors.fieldSelectors.equals: [Management]
+tests:
+  positive:
+    - name: management events dropped
+      events:
+        - eventSource: cloudtrail.amazonaws.com
+          eventName: PutEventSelectors
+          requestParameters:
+            trailName: org-trail
+            eventSelectors: [{readWriteType: All, includeManagementEvents: false, dataResources: []}]
+    - name: advanced selectors with data events only
+      events:
+        - eventSource: cloudtrail.amazonaws.com
+          eventName: PutEventSelectors
+          requestParameters:
+            trailName: org-trail
+            advancedEventSelectors:
+              - fieldSelectors: [{field: eventCategory, equals: [Data]}, {field: resources.type, equals: ["AWS::S3::Object"]}]
+    - name: trail redirected to another bucket
+      events:
+        - {eventSource: cloudtrail.amazonaws.com, eventName: UpdateTrail, requestParameters: {name: org-trail, s3BucketName: attacker-bucket}}
+  negative:
+    - name: management events kept
+      events:
+        - eventSource: cloudtrail.amazonaws.com
+          eventName: PutEventSelectors
+          requestParameters:
+            trailName: org-trail
+            eventSelectors: [{readWriteType: All, includeManagementEvents: true}]
+    - name: advanced selectors keep management events
+      events:
+        - eventSource: cloudtrail.amazonaws.com
+          eventName: PutEventSelectors
+          requestParameters:
+            trailName: org-trail
+            advancedEventSelectors:
+              - fieldSelectors: [{field: eventCategory, equals: [Management]}]
+---
+id: cloudtrail-logging-not-restarted
+title: CloudTrail logging stopped and not restarted within 30 minutes
+type: sequence
+severity: critical
+description: >
+  StopLogging succeeded and no StartLogging for the same trail followed within
+  30 minutes. Distinguishes a quick maintenance toggle from a blind spot that
+  is being exploited. (Uses an `absent` step.)
+attack: [T1562.008]
+falsepositives:
+  - The trail was restarted under a different identifier (name vs ARN).
+by: [requestParameters.name]
+within: 2h
+steps:
+  - name: logging stopped
+    match: {eventName: StopLogging, errorCode: {exists: false}}
+  - name: logging restarted
+    absent: true
+    within: 30m
+    match: {eventName: StartLogging, errorCode: {exists: false}}
+tests:
+  positive:
+    - name: never restarted (data continues past the deadline)
+      events:
+        - {eventSource: cloudtrail.amazonaws.com, eventName: StopLogging, requestParameters: {name: org-trail}}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, _at: 45m}
+    - name: restarted too late
+      expect: 1
+      events:
+        - {eventSource: cloudtrail.amazonaws.com, eventName: StopLogging, requestParameters: {name: org-trail}}
+        - {eventSource: cloudtrail.amazonaws.com, eventName: StartLogging, requestParameters: {name: org-trail}, _at: 40m}
+  negative:
+    - name: restarted in time
+      events:
+        - {eventSource: cloudtrail.amazonaws.com, eventName: StopLogging, requestParameters: {name: org-trail}}
+        - {eventSource: cloudtrail.amazonaws.com, eventName: StartLogging, requestParameters: {name: org-trail}, _at: 10m}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, _at: 45m}
+    - name: data ends before the deadline (cannot conclude)
+      events:
+        - {eventSource: cloudtrail.amazonaws.com, eventName: StopLogging, requestParameters: {name: org-trail}}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, _at: 5m}
+---
+id: security-monitoring-disabled
+title: Security monitoring service disabled or suppressed
+type: match
+severity: high
+description: >
+  GuardDuty detector deleted/disabled or findings auto-archived, Security Hub
+  disabled, AWS Config recording stopped, IAM Access Analyzer or Macie removed.
+attack: [T1562.001]
+falsepositives:
+  - Account decommissioning or a planned move to delegated-administrator setups.
+match:
+  errorCode: {exists: false}
+  any:
+    - eventSource: guardduty.amazonaws.com
+      eventName: [DeleteDetector, DisassociateFromMasterAccount, DisassociateFromAdministratorAccount, DeleteMembers, DisassociateMembers, StopMonitoringMembers, DeletePublishingDestination]
+    - eventSource: guardduty.amazonaws.com
+      eventName: UpdateDetector
+      requestParameters.enable: false
+    - eventSource: guardduty.amazonaws.com
+      eventName: [CreateFilter, UpdateFilter]
+      requestParameters.action: ARCHIVE
+    - eventSource: securityhub.amazonaws.com
+      eventName: [DisableSecurityHub, BatchDisableStandards, DisableImportFindingsForProduct]
+    - eventSource: config.amazonaws.com
+      eventName: [StopConfigurationRecorder, DeleteConfigurationRecorder, DeleteDeliveryChannel]
+    - eventSource: access-analyzer.amazonaws.com
+      eventName: DeleteAnalyzer
+    - eventSource: macie2.amazonaws.com
+      eventName: DisableMacie
+tests:
+  positive:
+    - {eventSource: guardduty.amazonaws.com, eventName: DeleteDetector, requestParameters: {detectorId: 12abc}}
+    - {eventSource: guardduty.amazonaws.com, eventName: UpdateDetector, requestParameters: {detectorId: 12abc, enable: false}}
+    - {eventSource: config.amazonaws.com, eventName: StopConfigurationRecorder, requestParameters: {configurationRecorderName: default}}
+    - {eventSource: guardduty.amazonaws.com, eventName: CreateFilter, requestParameters: {detectorId: 12abc, name: quiet, action: ARCHIVE}}
+  negative:
+    - {eventSource: guardduty.amazonaws.com, eventName: UpdateDetector, requestParameters: {detectorId: 12abc, enable: true}}
+    - {eventSource: guardduty.amazonaws.com, eventName: CreateFilter, requestParameters: {detectorId: 12abc, name: n, action: NOOP}}
+    - {eventSource: config.amazonaws.com, eventName: StopConfigurationRecorder, errorCode: AccessDenied}

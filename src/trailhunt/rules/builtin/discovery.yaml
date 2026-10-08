@@ -1,0 +1,138 @@
+# Discovery: enumeration bursts, permission probing, region sweeps, attacker tooling.
+
+id: enumeration-burst
+title: Burst of distinct List/Describe/Get API calls
+type: threshold
+severity: medium
+description: >
+  One principal called 25 or more *different* List*, Describe* or Get* APIs
+  within 10 minutes from a programmatic client. Tools such as enumerate-iam,
+  Pacu, ScoutSuite or a curious intruder with stolen keys produce exactly this
+  shape; applications call a small, stable set of APIs.
+attack: [T1580, T1087.004, T1069.003, T1526]
+falsepositives:
+  - CSPM / inventory tools running under their own role (baseline them by actor).
+  - Console sessions are excluded because the console fans out many Describe calls.
+match:
+  eventName: {regex: "^(List|Describe|Get)"}
+  actor_type: {not_in: [AWSService]}
+  ua_family: {not_in: [console, aws-internal, aws-service]}
+group_by: [actor]
+window: 10m
+distinct: eventName
+threshold: 25
+suppress: 1h
+tests:
+  positive:
+    - events:
+        - eventSource: iam.amazonaws.com
+          _repeat: 30
+          _interval: 5s
+          _cycle:
+            eventName: [ListUsers, ListRoles, ListGroups, ListPolicies, GetAccountAuthorizationDetails, ListAccessKeys, GetUser, ListAttachedUserPolicies, ListUserPolicies, ListMFADevices, GetAccountSummary, ListInstanceProfiles, DescribeInstances, DescribeVolumes, DescribeSnapshots, DescribeSecurityGroups, DescribeVpcs, DescribeSubnets, ListBuckets, GetBucketPolicy, GetBucketAcl, ListFunctions, ListSecrets, DescribeDBInstances, ListKeys, DescribeTrails, GetTrailStatus, ListDetectors, DescribeRegions, GetCallerIdentity]
+  negative:
+    - name: same few APIs called many times
+      events:
+        - eventSource: ec2.amazonaws.com
+          _repeat: 200
+          _interval: 2s
+          _cycle: {eventName: [DescribeInstances, DescribeVolumes, DescribeTags]}
+    - name: many APIs but spread over hours
+      events:
+        - eventSource: iam.amazonaws.com
+          _repeat: 30
+          _interval: 10m
+          _cycle:
+            eventName: [ListUsers, ListRoles, ListGroups, ListPolicies, GetAccountAuthorizationDetails, ListAccessKeys, GetUser, ListAttachedUserPolicies, ListUserPolicies, ListMFADevices, GetAccountSummary, ListInstanceProfiles, DescribeInstances, DescribeVolumes, DescribeSnapshots, DescribeSecurityGroups, DescribeVpcs, DescribeSubnets, ListBuckets, GetBucketPolicy, GetBucketAcl, ListFunctions, ListSecrets, DescribeDBInstances, ListKeys, DescribeTrails, GetTrailStatus, ListDetectors, DescribeRegions, GetCallerIdentity]
+---
+id: access-denied-storm
+title: Storm of AccessDenied errors from one principal
+type: threshold
+severity: medium
+description: >
+  15 or more authorization failures for the same principal within 5 minutes -
+  typical of someone probing what a stolen credential is allowed to do.
+attack: [T1580, T1526]
+falsepositives:
+  - A deployment running with a freshly tightened policy; a misconfigured retrying client.
+match:
+  errorCode: [AccessDenied, AccessDeniedException, UnauthorizedOperation, Client.UnauthorizedOperation, UnauthorizedAccess, Forbidden]
+group_by: [actor]
+window: 5m
+threshold: 15
+suppress: 1h
+tests:
+  positive:
+    - events:
+        - {eventSource: iam.amazonaws.com, eventName: ListUsers, errorCode: AccessDenied, _repeat: 15, _interval: 10s}
+  negative:
+    - name: fourteen failures
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: ListUsers, errorCode: AccessDenied, _repeat: 14, _interval: 10s}
+    - name: failures spread out (window slides)
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: ListUsers, errorCode: AccessDenied, _repeat: 40, _interval: 30s}
+    - name: other errors
+      events:
+        - {eventSource: ec2.amazonaws.com, eventName: RunInstances, errorCode: Client.InstanceLimitExceeded, _repeat: 30}
+---
+id: region-sweep
+title: Principal active in many regions within minutes
+type: threshold
+severity: medium
+description: >
+  API calls in 5 or more distinct regions from one principal within 15 minutes.
+  Intruders sweep regions to find resources (or unmonitored places to run
+  workloads); applications are normally pinned to one or two regions.
+attack: [T1580, T1535]
+falsepositives:
+  - Multi-region inventory or monitoring integrations.
+match:
+  actor_type: {not_in: [AWSService]}
+  ua_family: {not_in: [console, aws-internal, aws-service]}
+group_by: [actor]
+window: 15m
+distinct: awsRegion
+threshold: 5
+suppress: 1h
+tests:
+  positive:
+    - events:
+        - eventSource: ec2.amazonaws.com
+          eventName: DescribeInstances
+          _repeat: 6
+          _interval: 30s
+          _cycle: {awsRegion: [us-east-1, us-east-2, us-west-2, eu-west-1, ap-southeast-1, ca-central-1]}
+  negative:
+    - events:
+        - eventSource: ec2.amazonaws.com
+          eventName: DescribeInstances
+          _repeat: 50
+          _interval: 30s
+          _cycle: {awsRegion: [us-east-1, ca-central-1]}
+---
+id: offensive-tool-user-agent
+title: API call from an offensive security distribution or tool
+type: match
+severity: medium
+description: >
+  The user agent reveals an offensive-security OS or framework (Kali, Parrot,
+  Pentoo, Pacu, CloudFox, Stratus Red Team). Expected only during authorized
+  penetration tests.
+attack: [T1078.004]
+falsepositives:
+  - Authorized red-team or penetration test engagements.
+match:
+  userAgent: {regex: "(?i)(kali|parrot|pentoo|pacu|cloudfox|stratus-red-team|weirdaal)"}
+suppress: 1h
+suppress_by: [actor, src_ip]
+tests:
+  positive:
+    - {eventSource: sts.amazonaws.com, eventName: GetCallerIdentity, userAgent: "aws-cli/2.15.30 Python/3.11.8 Linux/6.6.9-amd64 exe/x86_64.kali.2024 prompt/off command/sts.get-caller-identity"}
+    - name: one alert per actor and IP per hour
+      expect: 2
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: ListUsers, userAgent: "aws-cli/2.15.30 exe/x86_64.kali.2024", _repeat: 50, _interval: 30s}
+        - {eventSource: iam.amazonaws.com, eventName: ListUsers, userAgent: "aws-cli/2.15.30 exe/x86_64.kali.2024", _at: 2h}
+  negative:
+    - {eventSource: sts.amazonaws.com, eventName: GetCallerIdentity, userAgent: "aws-cli/2.15.30 Python/3.11.8 Linux/6.1.0 exe/x86_64.ubuntu.22"}

@@ -1,0 +1,197 @@
+# Collection, exfiltration and impact.
+
+id: s3-bucket-made-public
+title: S3 bucket policy or ACL grants public access
+type: match
+severity: high
+description: >
+  PutBucketPolicy with a wildcard Principal, or PutBucketAcl granting AllUsers /
+  AuthenticatedUsers (or a public canned ACL).
+attack: [T1530, T1537]
+falsepositives:
+  - Static website buckets; wildcard principals restricted by a Condition (e.g. aws:SourceVpce) are matched too - review the policy.
+match:
+  eventSource: s3.amazonaws.com
+  errorCode: {exists: false}
+  any:
+    - eventName: PutBucketPolicy
+      any:
+        - requestParameters.bucketPolicy.Statement.Principal: "*"
+        - requestParameters.bucketPolicy.Statement.Principal.AWS: "*"
+    - eventName: PutBucketAcl
+      any:
+        - requestParameters.AccessControlPolicy.AccessControlList.Grant.Grantee.URI: {glob: ["*/global/AllUsers", "*/global/AuthenticatedUsers"]}
+        - requestParameters.x-amz-acl: [public-read, public-read-write, authenticated-read]
+tests:
+  positive:
+    - name: wildcard principal
+      events:
+        - eventSource: s3.amazonaws.com
+          eventName: PutBucketPolicy
+          requestParameters:
+            bucketName: backups
+            bucketPolicy: {Version: "2012-10-17", Statement: [{Effect: Allow, Principal: "*", Action: "s3:GetObject", Resource: "arn:aws:s3:::backups/*"}]}
+    - name: AllUsers ACL grant
+      events:
+        - eventSource: s3.amazonaws.com
+          eventName: PutBucketAcl
+          requestParameters:
+            bucketName: backups
+            AccessControlPolicy:
+              AccessControlList:
+                Grant:
+                  - {Grantee: {URI: "http://acs.amazonaws.com/groups/global/AllUsers", xsi:type: Group}, Permission: READ}
+  negative:
+    - name: account principal
+      events:
+        - eventSource: s3.amazonaws.com
+          eventName: PutBucketPolicy
+          requestParameters:
+            bucketName: logs
+            bucketPolicy: {Statement: [{Effect: Allow, Principal: {AWS: "arn:aws:iam::111111111111:root"}, Action: "s3:PutObject"}]}
+---
+id: s3-public-access-block-removed
+title: S3 Block Public Access removed or relaxed
+type: match
+severity: medium
+description: >
+  The bucket- or account-level Block Public Access configuration was deleted,
+  or re-applied with protections turned off - usually the step right before a
+  bucket is made public.
+attack: [T1562.001, T1530]
+falsepositives:
+  - Intentional public website buckets.
+match:
+  errorCode: {exists: false}
+  any:
+    - eventName: [DeleteBucketPublicAccessBlock, DeletePublicAccessBlock, DeleteAccountPublicAccessBlock]
+    - eventName: [PutBucketPublicAccessBlock, PutPublicAccessBlock, PutAccountPublicAccessBlock]
+      any:
+        - requestParameters.PublicAccessBlockConfiguration.BlockPublicPolicy: false
+        - requestParameters.PublicAccessBlockConfiguration.RestrictPublicBuckets: false
+        - requestParameters.PublicAccessBlockConfiguration.BlockPublicAcls: false
+tests:
+  positive:
+    - {eventSource: s3.amazonaws.com, eventName: DeleteBucketPublicAccessBlock, requestParameters: {bucketName: backups}}
+    - eventSource: s3.amazonaws.com
+      eventName: PutBucketPublicAccessBlock
+      requestParameters:
+        bucketName: backups
+        PublicAccessBlockConfiguration: {BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: false, RestrictPublicBuckets: false}
+  negative:
+    - eventSource: s3.amazonaws.com
+      eventName: PutBucketPublicAccessBlock
+      requestParameters:
+        bucketName: backups
+        PublicAccessBlockConfiguration: {BlockPublicAcls: true, IgnorePublicAcls: true, BlockPublicPolicy: true, RestrictPublicBuckets: true}
+---
+id: snapshot-shared-externally
+title: Snapshot or AMI shared with another account or made public
+type: match
+severity: high
+description: >
+  EBS snapshot, AMI, RDS snapshot or RDS cluster snapshot permissions were
+  modified to add an account other than the owner, or "all" (public). Sharing
+  a snapshot is the fastest way to copy whole disks/databases out of an account.
+attack: [T1537]
+falsepositives:
+  - Sharing with known accounts of the same organization (add an allowlist with not/in on the account id).
+match:
+  errorCode: {exists: false}
+  any:
+    - eventName: ModifySnapshotAttribute
+      any:
+        - requestParameters.createVolumePermission.add.items.userId: {ne_field: recipientAccountId}
+        - requestParameters.createVolumePermission.add.items.group: all
+    - eventName: ModifyImageAttribute
+      any:
+        - requestParameters.launchPermission.add.items.userId: {ne_field: recipientAccountId}
+        - requestParameters.launchPermission.add.items.group: all
+    - eventName: [ModifyDBSnapshotAttribute, ModifyDBClusterSnapshotAttribute]
+      requestParameters.attributeName: restore
+      requestParameters.valuesToAdd: {ne_field: recipientAccountId}
+tests:
+  positive:
+    - name: EBS snapshot to foreign account
+      events:
+        - eventSource: ec2.amazonaws.com
+          eventName: ModifySnapshotAttribute
+          requestParameters:
+            snapshotId: snap-0abc
+            attributeType: CREATE_VOLUME_PERMISSION
+            createVolumePermission: {add: {items: [{userId: "444455556666"}]}}
+    - name: RDS snapshot public
+      events:
+        - eventSource: rds.amazonaws.com
+          eventName: ModifyDBSnapshotAttribute
+          requestParameters: {dBSnapshotIdentifier: prod-db-snap, attributeName: restore, valuesToAdd: [all]}
+  negative:
+    - name: removal of a permission
+      events:
+        - eventSource: ec2.amazonaws.com
+          eventName: ModifySnapshotAttribute
+          requestParameters:
+            snapshotId: snap-0abc
+            createVolumePermission: {remove: {items: [{userId: "444455556666"}]}}
+    - name: same account
+      events:
+        - eventSource: rds.amazonaws.com
+          eventName: ModifyDBSnapshotAttribute
+          requestParameters: {dBSnapshotIdentifier: s, attributeName: restore, valuesToAdd: ["111111111111"]}
+---
+id: secrets-bulk-retrieval
+title: Many distinct secrets retrieved in a short time
+type: threshold
+severity: high
+description: >
+  One principal read 8 or more different Secrets Manager secrets within 10
+  minutes. Applications read the same one or two secrets repeatedly; harvesting
+  touches many.
+attack: [T1555.006]
+falsepositives:
+  - Secret rotation tooling or a migration job.
+match:
+  eventSource: secretsmanager.amazonaws.com
+  eventName: GetSecretValue
+  errorCode: {exists: false}
+group_by: [actor]
+window: 10m
+distinct: requestParameters.secretId
+threshold: 8
+tests:
+  positive:
+    - events:
+        - eventSource: secretsmanager.amazonaws.com
+          eventName: GetSecretValue
+          _repeat: 8
+          _interval: 15s
+          _cycle: {requestParameters.secretId: [prod/db, prod/stripe, prod/github, prod/slack, prod/sendgrid, prod/jwt, prod/redis, prod/okta]}
+  negative:
+    - name: same secrets read repeatedly
+      events:
+        - eventSource: secretsmanager.amazonaws.com
+          eventName: GetSecretValue
+          _repeat: 300
+          _interval: 2s
+          _cycle: {requestParameters.secretId: [prod/db, prod/redis]}
+---
+id: kms-key-disabled-or-scheduled-deletion
+title: KMS key disabled or scheduled for deletion
+type: match
+severity: high
+description: >
+  DisableKey or ScheduleKeyDeletion on a customer managed key. Destroying keys
+  renders the data they protect unrecoverable (ransom / destruction).
+attack: [T1485, T1486]
+falsepositives:
+  - Planned key retirement.
+match:
+  eventSource: kms.amazonaws.com
+  eventName: [ScheduleKeyDeletion, DisableKey]
+  errorCode: {exists: false}
+tests:
+  positive:
+    - {eventSource: kms.amazonaws.com, eventName: ScheduleKeyDeletion, requestParameters: {keyId: "arn:aws:kms:us-east-1:111111111111:key/1234", pendingWindowInDays: 7}}
+  negative:
+    - {eventSource: kms.amazonaws.com, eventName: Decrypt}
+    - {eventSource: kms.amazonaws.com, eventName: DisableKey, errorCode: AccessDeniedException}

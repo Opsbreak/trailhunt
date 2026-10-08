@@ -1,0 +1,97 @@
+# First-seen (new_value) behavioural anomalies. They learn from the first 7 days
+# of data (or from a --state file carried between runs) and then flag values an
+# actor has never used before.
+
+id: new-region-for-actor
+title: Actor active in a region it has never used
+type: new_value
+severity: low
+description: >
+  A principal made an API call in an AWS region it did not use during the
+  baseline. Intruders favour unused regions to hide crypto-miners and
+  infrastructure.
+attack: [T1535]
+falsepositives:
+  - Expansion to new regions; global-service calls are logged in us-east-1.
+match:
+  actor_type: {not_in: [AWSService]}
+group_by: [actor]
+value: awsRegion
+baseline: 7d
+tests:
+  positive:
+    - events:
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: ca-central-1}
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: sa-east-1, _at: 8d}
+  negative:
+    - name: still learning
+      events:
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: ca-central-1}
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: sa-east-1, _at: 2d}
+    - name: known region
+      events:
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: ca-central-1}
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: ca-central-1, _at: 8d}
+    - name: brand-new actor is learned, not flagged
+      events:
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: ca-central-1}
+        - {eventSource: ec2.amazonaws.com, eventName: DescribeInstances, awsRegion: sa-east-1, _user: newcomer, _at: 8d}
+---
+id: new-user-agent-for-actor
+title: Actor using a client family it has never used
+type: new_value
+severity: low
+description: >
+  A principal's user agent family (aws-cli, boto3, terraform, console, SDKs ...)
+  was not seen during the baseline. A service account that always uses boto3
+  suddenly calling from the AWS CLI is a classic stolen-key signal.
+attack: [T1078.004]
+falsepositives:
+  - Engineers debugging a service role by hand; tooling upgrades that change the client.
+match:
+  actor_type: {not_in: [AWSService]}
+group_by: [actor]
+value: ua_family
+baseline: 7d
+tests:
+  positive:
+    - events:
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, userAgent: "Boto3/1.34.0 md/Botocore#1.34.0 Python/3.12.1"}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, userAgent: "aws-cli/2.15.30 Python/3.11.8 Linux/6.6.9", _at: 8d}
+  negative:
+    - name: version change within the same family
+      events:
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, userAgent: "Boto3/1.34.0 Python/3.12.1"}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, userAgent: "Boto3/1.35.9 Python/3.12.4", _at: 8d}
+---
+id: new-source-network-for-actor
+title: Actor calling from a network (/16) it has never used
+type: new_value
+severity: low
+description: >
+  The source IPv4 /16 (IPv6 /48) of a principal's API call was not seen during
+  the baseline. Calls made by AWS services on the principal's behalf (source is
+  a service name, not an IP) are ignored.
+attack: [T1078.004]
+falsepositives:
+  - Travel, new office or VPN egress, CI runners with large IP pools.
+match:
+  actor_type: {not_in: [AWSService]}
+  sourceIPAddress: {cidr: ["0.0.0.0/0", "::/0"]}
+group_by: [actor]
+value: sourceIPAddress|net16
+baseline: 7d
+tests:
+  positive:
+    - events:
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, sourceIPAddress: 198.51.100.10}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, sourceIPAddress: 185.220.101.34, _at: 8d}
+  negative:
+    - name: same /16
+      events:
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, sourceIPAddress: 198.51.100.10}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, sourceIPAddress: 198.51.7.99, _at: 8d}
+    - name: service-originated call
+      events:
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, sourceIPAddress: 198.51.100.10}
+        - {eventSource: s3.amazonaws.com, eventName: ListBuckets, sourceIPAddress: cloudformation.amazonaws.com, _at: 8d}

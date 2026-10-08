@@ -1,0 +1,334 @@
+# Identity, credential access and persistence rules.
+
+id: root-account-usage
+title: Root account used
+type: match
+severity: high
+description: >
+  The account root user made an API call or signed in. Root should be locked
+  away behind hardware MFA and used only for the handful of tasks that require it.
+attack: [T1078.004]
+falsepositives:
+  - Documented break-glass procedures and root-only tasks (closing the account, changing support plan).
+match:
+  userIdentity.type: Root
+  userIdentity.invokedBy: {exists: false}
+  eventType: {not_in: [AwsServiceEvent]}
+suppress: 1h
+tests:
+  positive:
+    - name: root console login
+      events:
+        - eventSource: signin.amazonaws.com
+          eventName: ConsoleLogin
+          eventType: AwsConsoleSignIn
+          userIdentity: {type: Root, principalId: "111111111111", arn: "arn:aws:iam::111111111111:root", accountId: "111111111111"}
+          responseElements: {ConsoleLogin: Success}
+  negative:
+    - name: service acting on behalf of root
+      events:
+        - eventSource: iam.amazonaws.com
+          eventName: GetAccountSummary
+          userIdentity: {type: Root, accountId: "111111111111", invokedBy: "support.amazonaws.com"}
+    - name: IAM user
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: ListUsers, _user: alice}
+---
+id: console-login-without-mfa
+title: Console sign-in without MFA
+type: match
+severity: medium
+description: An IAM user or the root user signed in to the AWS console successfully without MFA.
+attack: [T1078.004]
+falsepositives:
+  - IAM users that have not enrolled MFA yet (fix the user rather than the rule).
+  - Federated (SSO) sign-ins are not IAM users and are not matched.
+match:
+  eventName: ConsoleLogin
+  responseElements.ConsoleLogin: Success
+  additionalEventData.MFAUsed: "No"
+  userIdentity.type: [IAMUser, Root]
+tests:
+  positive:
+    - events:
+        - eventSource: signin.amazonaws.com
+          eventName: ConsoleLogin
+          _user: legacy-admin
+          responseElements: {ConsoleLogin: Success}
+          additionalEventData: {MFAUsed: "No", LoginTo: "https://console.aws.amazon.com/"}
+  negative:
+    - name: MFA used
+      events:
+        - eventSource: signin.amazonaws.com
+          eventName: ConsoleLogin
+          _user: legacy-admin
+          responseElements: {ConsoleLogin: Success}
+          additionalEventData: {MFAUsed: "Yes"}
+    - name: failed login
+      events:
+        - eventSource: signin.amazonaws.com
+          eventName: ConsoleLogin
+          _user: legacy-admin
+          errorMessage: Failed authentication
+          responseElements: {ConsoleLogin: Failure}
+          additionalEventData: {MFAUsed: "No"}
+---
+id: console-brute-force-success
+title: Console brute force followed by successful sign-in
+type: sequence
+severity: high
+description: >
+  Five or more failed console sign-ins for the same principal within 15 minutes,
+  followed by a successful sign-in within the next 15 minutes.
+attack: [T1110.001, T1078.004]
+falsepositives:
+  - A user who forgot their password and then remembered it (check source IP and MFA).
+by: [actor]
+within: 30m
+steps:
+  - name: failed sign-ins
+    count: 5
+    within: 15m
+    match:
+      eventName: ConsoleLogin
+      responseElements.ConsoleLogin: Failure
+  - name: successful sign-in
+    within: 15m
+    match:
+      eventName: ConsoleLogin
+      responseElements.ConsoleLogin: Success
+tests:
+  positive:
+    - events:
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: legacy-admin, responseElements: {ConsoleLogin: Failure}, _repeat: 6, _interval: 20s}
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: legacy-admin, responseElements: {ConsoleLogin: Success}, _at: 5m}
+  negative:
+    - name: too few failures
+      events:
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: legacy-admin, responseElements: {ConsoleLogin: Failure}, _repeat: 3}
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: legacy-admin, responseElements: {ConsoleLogin: Success}, _at: 2m}
+    - name: success too late
+      events:
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: legacy-admin, responseElements: {ConsoleLogin: Failure}, _repeat: 6}
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: legacy-admin, responseElements: {ConsoleLogin: Success}, _at: 2h}
+    - name: failures for a different user
+      events:
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: bob, responseElements: {ConsoleLogin: Failure}, _repeat: 6}
+        - {eventSource: signin.amazonaws.com, eventName: ConsoleLogin, _user: legacy-admin, responseElements: {ConsoleLogin: Success}, _at: 2m}
+---
+id: iam-persistence-new-admin-user
+title: New IAM user created, given an access key and admin rights
+type: sequence
+severity: critical
+description: >
+  CreateUser, then CreateAccessKey for that user, then an administrator policy
+  attached (or an inline wildcard policy put) on that same user within one hour -
+  the classic backdoor-user persistence pattern. Steps are joined on the target
+  user name, not on the caller, so it also catches several stolen principals
+  cooperating.
+attack: [T1136.003, T1098.001, T1098.003]
+falsepositives:
+  - Break-glass user provisioning done by hand. Infrastructure-as-code should not create admin users with keys.
+by: [requestParameters.userName]
+within: 1h
+steps:
+  - name: user created
+    match: {eventName: CreateUser, errorCode: {exists: false}}
+  - name: access key created
+    match: {eventName: CreateAccessKey, errorCode: {exists: false}}
+  - name: admin privileges granted
+    match:
+      errorCode: {exists: false}
+      any:
+        - eventName: AttachUserPolicy
+          requestParameters.policyArn: {glob: ["arn:aws*:iam::aws:policy/AdministratorAccess", "arn:aws*:iam::aws:policy/IAMFullAccess"]}
+        - eventName: PutUserPolicy
+          requestParameters.policyDocument|json.Statement.Action: ["*", "iam:*"]
+tests:
+  positive:
+    - name: managed admin policy
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateUser, requestParameters: {userName: backdoor}}
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, requestParameters: {userName: backdoor}, _at: 2m}
+        - {eventSource: iam.amazonaws.com, eventName: AttachUserPolicy, requestParameters: {userName: backdoor, policyArn: "arn:aws:iam::aws:policy/AdministratorAccess"}, _at: 3m}
+    - name: inline wildcard policy (URL-encoded document)
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateUser, requestParameters: {userName: backdoor}}
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, requestParameters: {userName: backdoor}, _at: 2m}
+        - {eventSource: iam.amazonaws.com, eventName: PutUserPolicy, requestParameters: {userName: backdoor, policyName: p, policyDocument: "%7B%22Version%22%3A%222012-10-17%22%2C%22Statement%22%3A%5B%7B%22Effect%22%3A%22Allow%22%2C%22Action%22%3A%22*%22%2C%22Resource%22%3A%22*%22%7D%5D%7D"}, _at: 3m}
+  negative:
+    - name: steps for different users
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateUser, requestParameters: {userName: one}}
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, requestParameters: {userName: two}, _at: 2m}
+        - {eventSource: iam.amazonaws.com, eventName: AttachUserPolicy, requestParameters: {userName: one, policyArn: "arn:aws:iam::aws:policy/AdministratorAccess"}, _at: 3m}
+    - name: out of order
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateUser, requestParameters: {userName: backdoor}}
+        - {eventSource: iam.amazonaws.com, eventName: AttachUserPolicy, requestParameters: {userName: backdoor, policyArn: "arn:aws:iam::aws:policy/AdministratorAccess"}, _at: 1m}
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, requestParameters: {userName: backdoor}, _at: 2m}
+    - name: outside the one hour window
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateUser, requestParameters: {userName: backdoor}}
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, requestParameters: {userName: backdoor}, _at: 30m}
+        - {eventSource: iam.amazonaws.com, eventName: AttachUserPolicy, requestParameters: {userName: backdoor, policyArn: "arn:aws:iam::aws:policy/AdministratorAccess"}, _at: 61m}
+    - name: read-only policy
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateUser, requestParameters: {userName: auditor}}
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, requestParameters: {userName: auditor}, _at: 2m}
+        - {eventSource: iam.amazonaws.com, eventName: AttachUserPolicy, requestParameters: {userName: auditor, policyArn: "arn:aws:iam::aws:policy/ReadOnlyAccess"}, _at: 3m}
+---
+id: iam-access-key-for-other-user
+title: Access key created for another IAM user
+type: match
+severity: medium
+description: >
+  A principal created an access key for an IAM user other than itself. Attackers
+  holding iam:CreateAccessKey use this to mint long-lived credentials for an
+  existing (often more privileged) user.
+attack: [T1098.001]
+falsepositives:
+  - Administrators or provisioning pipelines that issue keys for service users.
+match:
+  eventName: CreateAccessKey
+  errorCode: {exists: false}
+  requestParameters.userName: {exists: true, ne_field: userIdentity.userName}
+tests:
+  positive:
+    - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, _user: mallory, requestParameters: {userName: admin-bob}}
+    - name: assumed role creating a key for a user
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, _role: deployer/s1, requestParameters: {userName: admin-bob}}
+  negative:
+    - name: own key, explicit user name
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, _user: alice, requestParameters: {userName: alice}}
+    - name: own key, implicit user
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, _user: alice}
+    - name: denied
+      events:
+        - {eventSource: iam.amazonaws.com, eventName: CreateAccessKey, _user: mallory, errorCode: AccessDenied, requestParameters: {userName: admin-bob}}
+---
+id: iam-login-profile-for-other-user
+title: Console password set for another IAM user
+type: match
+severity: high
+description: >
+  CreateLoginProfile or UpdateLoginProfile was called for a user other than the
+  caller - gives console access to (or takes over) another identity.
+attack: [T1098]
+falsepositives:
+  - Helpdesk password resets performed by administrators.
+match:
+  eventName: [CreateLoginProfile, UpdateLoginProfile]
+  errorCode: {exists: false}
+  requestParameters.userName: {exists: true, ne_field: userIdentity.userName}
+tests:
+  positive:
+    - {eventSource: iam.amazonaws.com, eventName: CreateLoginProfile, _user: mallory, requestParameters: {userName: svc-reporting, passwordResetRequired: false}}
+    - {eventSource: iam.amazonaws.com, eventName: UpdateLoginProfile, _user: mallory, requestParameters: {userName: admin-bob}}
+  negative:
+    - {eventSource: iam.amazonaws.com, eventName: UpdateLoginProfile, _user: alice, requestParameters: {userName: alice}}
+---
+id: iam-admin-policy-attached
+title: AdministratorAccess attached to a principal
+type: match
+severity: medium
+description: The AWS managed AdministratorAccess (or IAMFullAccess) policy was attached to a user, group or role.
+attack: [T1098.003]
+falsepositives:
+  - Intentional admin grants through change management.
+match:
+  eventName: [AttachUserPolicy, AttachRolePolicy, AttachGroupPolicy]
+  errorCode: {exists: false}
+  requestParameters.policyArn: {glob: ["arn:aws*:iam::aws:policy/AdministratorAccess", "arn:aws*:iam::aws:policy/IAMFullAccess"]}
+tests:
+  positive:
+    - {eventSource: iam.amazonaws.com, eventName: AttachRolePolicy, requestParameters: {roleName: x, policyArn: "arn:aws:iam::aws:policy/AdministratorAccess"}}
+  negative:
+    - {eventSource: iam.amazonaws.com, eventName: AttachRolePolicy, requestParameters: {roleName: x, policyArn: "arn:aws:iam::aws:policy/ReadOnlyAccess"}}
+---
+id: iam-role-trust-external-principal
+title: Role trust policy allows an external or wildcard principal
+type: match
+severity: high
+description: >
+  UpdateAssumeRolePolicy (or CreateRole) set a trust policy whose Principal.AWS
+  belongs to a different account, or is a wildcard. This is a stealthy
+  cross-account backdoor: the attacker can assume the role from their own account.
+attack: [T1098.003, T1199]
+falsepositives:
+  - Onboarding third-party integrations (monitoring, CSPM) that legitimately assume a role from their account - verify the account id and ExternalId condition.
+match:
+  eventSource: iam.amazonaws.com
+  errorCode: {exists: false}
+  any:
+    - eventName: UpdateAssumeRolePolicy
+      any:
+        - requestParameters.policyDocument|json.Statement.Principal.AWS|account: {ne_field: recipientAccountId}
+        - requestParameters.policyDocument|json.Statement.Principal: "*"
+    - eventName: CreateRole
+      any:
+        - requestParameters.assumeRolePolicyDocument|json.Statement.Principal.AWS|account: {ne_field: recipientAccountId}
+        - requestParameters.assumeRolePolicyDocument|json.Statement.Principal: "*"
+tests:
+  positive:
+    - name: external account added
+      events:
+        - eventSource: iam.amazonaws.com
+          eventName: UpdateAssumeRolePolicy
+          requestParameters:
+            roleName: ops-admin
+            policyDocument: '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":["arn:aws:iam::111111111111:root","arn:aws:iam::444455556666:root"]},"Action":"sts:AssumeRole"}]}'
+    - name: wildcard principal on create
+      events:
+        - eventSource: iam.amazonaws.com
+          eventName: CreateRole
+          requestParameters:
+            roleName: open
+            assumeRolePolicyDocument: '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}'
+  negative:
+    - name: same-account and service principals only
+      events:
+        - eventSource: iam.amazonaws.com
+          eventName: UpdateAssumeRolePolicy
+          requestParameters:
+            roleName: app
+            policyDocument: '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::111111111111:role/ci","Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+---
+id: sts-new-cross-account-role
+title: Actor assumed a cross-account role it never assumed before
+type: new_value
+severity: medium
+description: >
+  A principal assumed a role that lives in a different AWS account, and this
+  (actor, role) pair was not seen during the baseline period. Lateral movement
+  into other accounts commonly shows up here first.
+attack: [T1550.001, T1078.004]
+falsepositives:
+  - New legitimate cross-account access (new pipeline, new organization member account).
+match:
+  eventName: AssumeRole
+  errorCode: {exists: false}
+  userIdentity.accountId: {exists: true}
+  userIdentity.type: {not_in: [AWSService]}
+  requestParameters.roleArn|account: {ne_field: userIdentity.accountId}
+group_by: [actor]
+value: requestParameters.roleArn
+baseline: 7d
+on_new_group: alert
+tests:
+  positive:
+    - events:
+        - {eventSource: sts.amazonaws.com, eventName: AssumeRole, _user: ci, requestParameters: {roleArn: "arn:aws:iam::222222222222:role/deploy", roleSessionName: a}}
+        - {eventSource: sts.amazonaws.com, eventName: AssumeRole, _user: ci, requestParameters: {roleArn: "arn:aws:iam::444455556666:role/xfer", roleSessionName: b}, _at: 8d}
+  negative:
+    - name: same role as baseline
+      events:
+        - {eventSource: sts.amazonaws.com, eventName: AssumeRole, _user: ci, requestParameters: {roleArn: "arn:aws:iam::222222222222:role/deploy", roleSessionName: a}}
+        - {eventSource: sts.amazonaws.com, eventName: AssumeRole, _user: ci, requestParameters: {roleArn: "arn:aws:iam::222222222222:role/deploy", roleSessionName: b}, _at: 8d}
+    - name: same-account role
+      events:
+        - {eventSource: sts.amazonaws.com, eventName: AssumeRole, _user: ci, requestParameters: {roleArn: "arn:aws:iam::111111111111:role/a"}}
+        - {eventSource: sts.amazonaws.com, eventName: AssumeRole, _user: ci, requestParameters: {roleArn: "arn:aws:iam::111111111111:role/b"}, _at: 8d}

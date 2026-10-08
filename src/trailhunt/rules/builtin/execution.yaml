@@ -1,0 +1,142 @@
+# Execution and exposure of compute.
+
+id: ec2-userdata-modified
+title: EC2 instance user data modified
+type: match
+severity: medium
+description: >
+  ModifyInstanceAttribute changed an instance's userData. User data runs as
+  root on the next boot, so this is a known way to execute code on (and
+  persist in) existing instances.
+attack: [T1059.009, T1098]
+falsepositives:
+  - Rare manual fixes; IaC normally replaces instances instead of editing user data.
+match:
+  eventName: ModifyInstanceAttribute
+  errorCode: {exists: false}
+  any:
+    - requestParameters.userData: {exists: true}
+    - requestParameters.attribute: userData
+tests:
+  positive:
+    - {eventSource: ec2.amazonaws.com, eventName: ModifyInstanceAttribute, requestParameters: {instanceId: i-0abc, userData: "<sensitiveDataRemoved>"}}
+  negative:
+    - {eventSource: ec2.amazonaws.com, eventName: ModifyInstanceAttribute, requestParameters: {instanceId: i-0abc, instanceType: {value: m5.large}}}
+---
+id: ssm-sendcommand-burst
+title: SSM SendCommand fanned out to many instances
+type: threshold
+severity: high
+description: >
+  One principal sent SSM Run Command to 10 or more distinct instances within
+  15 minutes - remote code execution at fleet scale.
+attack: [T1651]
+falsepositives:
+  - Patch or configuration runs by an operations role (baseline by actor). Tag-based targets are not counted.
+match:
+  eventSource: ssm.amazonaws.com
+  eventName: SendCommand
+  errorCode: {exists: false}
+group_by: [actor]
+window: 15m
+distinct: requestParameters.instanceIds
+threshold: 10
+tests:
+  positive:
+    - name: one call to many instances
+      events:
+        - eventSource: ssm.amazonaws.com
+          eventName: SendCommand
+          requestParameters: {documentName: AWS-RunShellScript, instanceIds: [i-01, i-02, i-03, i-04, i-05, i-06, i-07, i-08, i-09, i-10, i-11]}
+    - name: many calls one instance each
+      events:
+        - eventSource: ssm.amazonaws.com
+          eventName: SendCommand
+          _repeat: 10
+          _interval: 20s
+          _cycle: {requestParameters.instanceIds: [[i-01], [i-02], [i-03], [i-04], [i-05], [i-06], [i-07], [i-08], [i-09], [i-10]]}
+  negative:
+    - events:
+        - eventSource: ssm.amazonaws.com
+          eventName: SendCommand
+          _repeat: 50
+          _cycle: {requestParameters.instanceIds: [[i-01], [i-02]]}
+---
+id: security-group-opened-to-world
+title: Security group opened to the internet on a sensitive port
+type: match
+severity: high
+description: >
+  AuthorizeSecurityGroupIngress allowing 0.0.0.0/0 or ::/0 to SSH, RDP,
+  databases, caches, Docker/etcd/Elasticsearch/Kibana or to all ports.
+  (Port and CIDR are checked across all permissions of the call.)
+attack: [T1562.007, T1133]
+falsepositives:
+  - Bastion hosts by design; short-lived debugging (still worth a look).
+match:
+  eventName: AuthorizeSecurityGroupIngress
+  errorCode: {exists: false}
+  all:
+    - any:
+        - requestParameters.ipPermissions.items.ipRanges.items.cidrIp: "0.0.0.0/0"
+        - requestParameters.ipPermissions.items.ipv6Ranges.items.cidrIpv6: "::/0"
+        - requestParameters.cidrIp: "0.0.0.0/0"
+    - any:
+        - requestParameters.ipPermissions.items.fromPort: [22, 23, 445, 1433, 1521, 2375, 2379, 3306, 3389, 5432, 5601, 5900, 6379, 9200, 11211, 27017]
+        - requestParameters.ipPermissions.items.ipProtocol: "-1"
+        - requestParameters.fromPort: [22, 3389]
+        - all:
+            - requestParameters.ipPermissions.items.fromPort: {lte: 22}
+            - requestParameters.ipPermissions.items.toPort: {gte: 3389}
+tests:
+  positive:
+    - name: SSH to the world
+      events:
+        - eventSource: ec2.amazonaws.com
+          eventName: AuthorizeSecurityGroupIngress
+          requestParameters:
+            groupId: sg-0abc
+            ipPermissions: {items: [{ipProtocol: tcp, fromPort: 22, toPort: 22, ipRanges: {items: [{cidrIp: 0.0.0.0/0}]}}]}
+    - name: all traffic
+      events:
+        - eventSource: ec2.amazonaws.com
+          eventName: AuthorizeSecurityGroupIngress
+          requestParameters:
+            groupId: sg-0abc
+            ipPermissions: {items: [{ipProtocol: "-1", ipv6Ranges: {items: [{cidrIpv6: "::/0"}]}}]}
+  negative:
+    - name: HTTPS to the world
+      events:
+        - eventSource: ec2.amazonaws.com
+          eventName: AuthorizeSecurityGroupIngress
+          requestParameters:
+            groupId: sg-0abc
+            ipPermissions: {items: [{ipProtocol: tcp, fromPort: 443, toPort: 443, ipRanges: {items: [{cidrIp: 0.0.0.0/0}]}}]}
+    - name: SSH from the office
+      events:
+        - eventSource: ec2.amazonaws.com
+          eventName: AuthorizeSecurityGroupIngress
+          requestParameters:
+            groupId: sg-0abc
+            ipPermissions: {items: [{ipProtocol: tcp, fromPort: 22, toPort: 22, ipRanges: {items: [{cidrIp: 203.0.113.0/24}]}}]}
+---
+id: lambda-function-url-public
+title: Lambda function URL created without authentication
+type: match
+severity: medium
+description: >
+  A Lambda function URL was created or updated with AuthType NONE, exposing
+  the function to anyone on the internet - a cheap backdoor / C2 endpoint.
+attack: [T1648, T1190]
+falsepositives:
+  - Public webhooks that do their own request signing.
+match:
+  eventSource: lambda.amazonaws.com
+  eventName: {glob: ["CreateFunctionUrlConfig*", "UpdateFunctionUrlConfig*"]}
+  errorCode: {exists: false}
+  requestParameters.authType: NONE
+tests:
+  positive:
+    - {eventSource: lambda.amazonaws.com, eventName: CreateFunctionUrlConfig20211031, requestParameters: {functionName: helper, authType: NONE}}
+  negative:
+    - {eventSource: lambda.amazonaws.com, eventName: CreateFunctionUrlConfig20211031, requestParameters: {functionName: helper, authType: AWS_IAM}}
